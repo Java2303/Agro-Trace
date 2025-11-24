@@ -112,6 +112,18 @@ def analyze_plot(plot_id: int):
     
     return {"message": f"Análisis completado para la Parcela {plot_id}", "status": status, "ph_level": ph, "nitrogen_level": nitrogen}
 
+
+@app.delete("/plots/{plot_id}")
+def delete_plot(plot_id: int):
+    """Elimina una parcela por su ID."""
+    # Buscar la parcela por ID
+    plot_to_delete = next((p for p in in_memory_db if p.id == plot_id), None)
+    if plot_to_delete is None:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+
+    in_memory_db.remove(plot_to_delete)
+    return {"message": f"Parcela {plot_id} eliminada correctamente."}
+
 # -----------------------------------------------------
 # ENDPOINT DE SALUD
 # -----------------------------------------------------
