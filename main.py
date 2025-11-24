@@ -153,7 +153,7 @@ def create_plot(plot_data: PlotBase):
 
     # Registrar auditoría: creación de parcela
     try:
-        log_audit(action='CREATE_PLOT', target_type='plot', target_id=str(new_plot.id), details={
+        log_audit(action='CREAR_PARCELA', target_type='parcela', target_id=str(new_plot.id), details={
             'name': new_plot.name,
             'crop_type': new_plot.crop_type,
             'area_hectares': new_plot.area_hectares
@@ -176,30 +176,46 @@ def analyze_plot(plot_id: int):
     # --- SIMULACIÓN DEL ANÁLISIS ---
     # Genera resultados de análisis aleatorios y determina el estado
 
-    # Generar niveles de suelo
+    # Generar niveles de suelo (simulados)
     ph = round(random.uniform(5.5, 7.5), 2)
     nitrogen = round(random.uniform(50.0, 300.0), 2)
 
-    # Lógica de certificación simulada
-    # El umbral para ser 'CERTIFICADO' es pH casi neutro y alto nitrógeno
-    if 6.0 <= ph <= 7.0 and nitrogen >= 150:
-        status = "CERTIFICADO"
-    elif ph < 5.8:
-        status = "OBSERVADO" # El suelo es demasiado ácido
+    # Umbrales por cultivo (valores propuestos para Santa Cruz, Bolivia — base orientativa)
+    # Las claves se comparan en minúsculas; si no hay coincidencia se usa 'default'.
+    thresholds = {
+        'default': {'pH_min': 5.8, 'pH_max': 7.2, 'n_min': 150},
+        'maiz':    {'pH_min': 5.8, 'pH_max': 7.0, 'n_min': 140},
+        'maíz':    {'pH_min': 5.8, 'pH_max': 7.0, 'n_min': 140},
+        'soja':    {'pH_min': 5.5, 'pH_max': 7.2, 'n_min': 120},
+        'soya':    {'pH_min': 5.5, 'pH_max': 7.2, 'n_min': 120},
+        'arroz':   {'pH_min': 5.0, 'pH_max': 6.8, 'n_min': 100}
+    }
+
+    crop_key = (plot_to_analyze.crop_type or '').strip().lower()
+    cfg = thresholds.get(crop_key, thresholds['default'])
+
+    # Decisión de certificación basada en los umbrales:
+    if cfg['pH_min'] <= ph <= cfg['pH_max'] and nitrogen >= cfg['n_min']:
+        status = 'CERTIFICADO'
     else:
-        status = "PENDIENTE" 
+        # Si el pH está claramente fuera del rango, marcar como OBSERVADO
+        if ph < cfg['pH_min'] or ph > cfg['pH_max']:
+            status = 'OBSERVADO'
+        else:
+            status = 'PENDIENTE'
 
     # Actualizar la parcela
     plot_to_analyze.status = status
     plot_to_analyze.ph_level = ph
     plot_to_analyze.nitrogen_level = nitrogen
 
-    # Registrar auditoría: análisis ejecutado
+    # Registrar auditoría: análisis ejecutado (acción en español)
     try:
-        log_audit(action='ANALYZE', target_type='plot', target_id=str(plot_id), details={
+        log_audit(action='ANALIZAR', target_type='parcela', target_id=str(plot_id), details={
             'ph': ph,
             'nitrogen': nitrogen,
-            'status': status
+            'status': status,
+            'applied_thresholds': cfg
         })
     except Exception:
         pass
@@ -219,7 +235,7 @@ def delete_plot(plot_id: int):
 
     # Registrar auditoría: eliminación de parcela
     try:
-        log_audit(action='DELETE_PLOT', target_type='plot', target_id=str(plot_id), details={
+        log_audit(action='ELIMINAR_PARCELA', target_type='parcela', target_id=str(plot_id), details={
             'name': plot_to_delete.name,
             'crop_type': plot_to_delete.crop_type
         })
