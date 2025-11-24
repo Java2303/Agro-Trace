@@ -5,100 +5,63 @@ from typing import List, Optional
 import random
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import io
 from fastapi.responses import StreamingResponse
 
-# Definición de Modelos Pydantic para la estructura de datos
-
+# MODELS
 class Coordinate(BaseModel):
-    """Representa un punto de Latitud (x) y Longitud (y)."""
-    # En el contexto geográfico, 'x' se usa a menudo para Latitud y 'y' para Longitud
-    x: float  # Latitud
-    y: float  # Longitud
+    x: float
+    y: float
 
 class PlotBase(BaseModel):
-    """Modelo base para crear una nueva parcela."""
     name: str
     crop_type: str
     area_hectares: float
     coordinates: List[Coordinate]
 
 class Plot(PlotBase):
-    """Modelo completo de la parcela, incluyendo su estado y resultados de análisis."""
     id: int
     status: str = "PENDIENTE"
     ph_level: Optional[float] = None
     nitrogen_level: Optional[float] = None
 
-# -----------------------------------------------------
-# Base de Datos Simulada (En memoria)
-# -----------------------------------------------------
-
-# Inicialización de la lista de parcelas y contador de IDs
+# IN-MEMORY DB
 in_memory_db: List[Plot] = []
 next_plot_id = 1
 
-# Inicialización de la aplicación FastAPI con el nuevo nombre
 app = FastAPI(title="Agro Trace API")
 
-# Configuración de CORS para permitir la comunicación con el frontend
-# Esto es CRÍTICO para que el frontend pueda llamar a esta API
-origins = [
-    "*", # Permite cualquier origen (necesario en desarrollo o entornos de prueba)
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS (DEV)
+origins = ["*"]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # -----------------------------------------------------
 # Endpoints de la API
 # -----------------------------------------------------
 
-# --------------------------
-# Auditoría (SQLite simple)
-# --------------------------
+# AUDIT (SQLite)
 DB_PATH = os.path.join(os.path.dirname(__file__), 'audit.db')
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS audit (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            actor TEXT,
-            action TEXT NOT NULL,
-            target_type TEXT,
-            target_id TEXT,
-            details TEXT
-        )
-    ''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, actor TEXT, action TEXT NOT NULL, target_type TEXT, target_id TEXT, details TEXT)''')
     conn.commit()
     conn.close()
 
 def log_audit(action: str, target_type: Optional[str] = None, target_id: Optional[str] = None, details: Optional[dict] = None, actor: Optional[str] = None):
-    """Guarda una entrada de auditoría en la base SQLite."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            'INSERT INTO audit (timestamp, actor, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?, ?)',
-            (datetime.utcnow().isoformat(), actor or 'system', action, target_type, str(target_id) if target_id is not None else None, json.dumps(details or {}))
-        )
+        cur.execute('INSERT INTO audit (timestamp, actor, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?, ?)', (datetime.now(timezone.utc).isoformat(), actor or 'system', action, target_type, str(target_id) if target_id is not None else None, json.dumps(details or {})))
         conn.commit()
     except Exception as e:
         print('Audit log failed:', e)
     finally:
-        try:
-            conn.close()
-        except:
-            pass
+        try: conn.close()
+        except: pass
 
 def query_audit(plot_id: Optional[str] = None, limit: int = 200):
     conn = sqlite3.connect(DB_PATH)
@@ -111,22 +74,11 @@ def query_audit(plot_id: Optional[str] = None, limit: int = 200):
     conn.close()
     result = []
     for r in rows:
-        try:
-            details = json.loads(r[6]) if r[6] else {}
-        except Exception:
-            details = {}
-        result.append({
-            'id': r[0],
-            'timestamp': r[1],
-            'actor': r[2],
-            'action': r[3],
-            'target_type': r[4],
-            'target_id': r[5],
-            'details': details
-        })
+        try: details = json.loads(r[6]) if r[6] else {}
+        except: details = {}
+        result.append({'id': r[0], 'timestamp': r[1], 'actor': r[2], 'action': r[3], 'target_type': r[4], 'target_id': r[5], 'details': details})
     return result
 
-# Inicializar DB de auditoría
 init_db()
 
 
@@ -266,14 +218,10 @@ def get_plot_history(plot_id: int, limit: int = 200):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -----------------------
 # PDF Certificate
-# -----------------------
 @app.get('/plots/{plot_id}/certificate')
 def get_plot_certificate(plot_id: int):
-    """Genera un PDF simple con los detalles de la parcela (certificado).
-    Retorna el PDF como StreamingResponse.
-    """
+    """Return PDF certificate for a plot."""
     plot = next((p for p in in_memory_db if p.id == plot_id), None)
     if plot is None:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
@@ -319,7 +267,7 @@ def get_plot_certificate(plot_id: int):
 
     # Footer
     c.setFont('Helvetica-Oblique', 9)
-    c.drawString(48, 48, f'Generado: {datetime.utcnow().isoformat()} UTC')
+    c.drawString(48, 48, f'Generado: {datetime.now(timezone.utc).isoformat()} UTC')
     c.save()
 
     buffer.seek(0)
