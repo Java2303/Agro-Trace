@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import random
+import sqlite3
+import os
+from datetime import datetime
+import json
 
 # Definición de Modelos Pydantic para la estructura de datos
 
@@ -54,6 +58,76 @@ app.add_middleware(
 # Endpoints de la API
 # -----------------------------------------------------
 
+# --------------------------
+# Auditoría (SQLite simple)
+# --------------------------
+DB_PATH = os.path.join(os.path.dirname(__file__), 'audit.db')
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            actor TEXT,
+            action TEXT NOT NULL,
+            target_type TEXT,
+            target_id TEXT,
+            details TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def log_audit(action: str, target_type: Optional[str] = None, target_id: Optional[str] = None, details: Optional[dict] = None, actor: Optional[str] = None):
+    """Guarda una entrada de auditoría en la base SQLite."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            'INSERT INTO audit (timestamp, actor, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?, ?)',
+            (datetime.utcnow().isoformat(), actor or 'system', action, target_type, str(target_id) if target_id is not None else None, json.dumps(details or {}))
+        )
+        conn.commit()
+    except Exception as e:
+        print('Audit log failed:', e)
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+def query_audit(plot_id: Optional[str] = None, limit: int = 200):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if plot_id is not None:
+        cur.execute('SELECT id, timestamp, actor, action, target_type, target_id, details FROM audit WHERE target_id = ? ORDER BY id DESC LIMIT ?', (str(plot_id), limit))
+    else:
+        cur.execute('SELECT id, timestamp, actor, action, target_type, target_id, details FROM audit ORDER BY id DESC LIMIT ?', (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        try:
+            details = json.loads(r[6]) if r[6] else {}
+        except Exception:
+            details = {}
+        result.append({
+            'id': r[0],
+            'timestamp': r[1],
+            'actor': r[2],
+            'action': r[3],
+            'target_type': r[4],
+            'target_id': r[5],
+            'details': details
+        })
+    return result
+
+# Inicializar DB de auditoría
+init_db()
+
+
 @app.get("/plots/", response_model=List[Plot])
 def list_plots():
     """Retorna la lista completa de parcelas registradas en Agro Trace."""
@@ -76,6 +150,16 @@ def create_plot(plot_data: PlotBase):
     
     in_memory_db.append(new_plot)
     next_plot_id += 1
+
+    # Registrar auditoría: creación de parcela
+    try:
+        log_audit(action='CREATE_PLOT', target_type='plot', target_id=str(new_plot.id), details={
+            'name': new_plot.name,
+            'crop_type': new_plot.crop_type,
+            'area_hectares': new_plot.area_hectares
+        })
+    except Exception:
+        pass
     
     return new_plot
 
@@ -109,6 +193,16 @@ def analyze_plot(plot_id: int):
     plot_to_analyze.status = status
     plot_to_analyze.ph_level = ph
     plot_to_analyze.nitrogen_level = nitrogen
+
+    # Registrar auditoría: análisis ejecutado
+    try:
+        log_audit(action='ANALYZE', target_type='plot', target_id=str(plot_id), details={
+            'ph': ph,
+            'nitrogen': nitrogen,
+            'status': status
+        })
+    except Exception:
+        pass
     
     return {"message": f"Análisis completado para la Parcela {plot_id}", "status": status, "ph_level": ph, "nitrogen_level": nitrogen}
 
@@ -122,7 +216,36 @@ def delete_plot(plot_id: int):
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
 
     in_memory_db.remove(plot_to_delete)
+
+    # Registrar auditoría: eliminación de parcela
+    try:
+        log_audit(action='DELETE_PLOT', target_type='plot', target_id=str(plot_id), details={
+            'name': plot_to_delete.name,
+            'crop_type': plot_to_delete.crop_type
+        })
+    except Exception:
+        pass
     return {"message": f"Parcela {plot_id} eliminada correctamente."}
+
+
+@app.get('/history')
+def get_history(plot_id: Optional[int] = None, limit: int = 200):
+    """Retorna las entradas de auditoría. Opcionalmente filtra por `plot_id`."""
+    try:
+        entries = query_audit(str(plot_id) if plot_id is not None else None, limit=limit)
+        return entries
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/plots/{plot_id}/history')
+def get_plot_history(plot_id: int, limit: int = 200):
+    """Retorna el historial de auditoría para una parcela específica."""
+    try:
+        entries = query_audit(str(plot_id), limit=limit)
+        return entries
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------
 # ENDPOINT DE SALUD
