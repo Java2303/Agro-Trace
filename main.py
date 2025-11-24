@@ -15,11 +15,55 @@ class Coordinate(BaseModel):
     x: float
     y: float
 
+    # Validación: x e y deben ser números finitos (no NaN ni ±Infinity)
+    @classmethod
+    def __get_validators__(cls):
+        yield from super().__get_validators__()
+        yield cls._validate_finite
+
+    @classmethod
+    def _validate_finite(cls, v):
+        # Pydantic llama al validador con la instancia ya construida para modelos
+        # Por compatibilidad, soportamos dicts o instancias.
+        import math
+        if isinstance(v, dict):
+            x = v.get('x')
+            y = v.get('y')
+        else:
+            x = getattr(v, 'x', None)
+            y = getattr(v, 'y', None)
+        try:
+            if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
+                raise ValueError('x y y deben ser numéricos')
+            if not (math.isfinite(float(x)) and math.isfinite(float(y))):
+                raise ValueError('Las coordenadas deben ser números finitos (no NaN/Infinity)')
+        except Exception as e:
+            raise ValueError(str(e))
+        return v
+
 class PlotBase(BaseModel):
     name: str
     crop_type: str
     area_hectares: float
     coordinates: List[Coordinate]
+
+    # Validación: mínimo 3 vértices en coordinates
+    @classmethod
+    def __get_validators__(cls):
+        yield from super().__get_validators__()
+        yield cls._validate_min_vertices
+
+    @classmethod
+    def _validate_min_vertices(cls, v):
+        coords = getattr(v, 'coordinates', None) if not isinstance(v, dict) else v.get('coordinates')
+        if coords is None:
+            raise ValueError('coordinates es requerido')
+        try:
+            if len(coords) < 3:
+                raise ValueError('Se requieren al menos 3 vértices en coordinates')
+        except TypeError:
+            raise ValueError('coordinates debe ser una lista de coordenadas')
+        return v
 
 class Plot(PlotBase):
     id: int
