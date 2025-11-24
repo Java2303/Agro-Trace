@@ -9,8 +9,6 @@ from datetime import datetime
 import json
 import io
 from fastapi.responses import StreamingResponse
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
 
 # Definición de Modelos Pydantic para la estructura de datos
 
@@ -279,6 +277,13 @@ def get_plot_certificate(plot_id: int):
     plot = next((p for p in in_memory_db if p.id == plot_id), None)
     if plot is None:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
+
+    # Import reportlab lazily so app doesn't crash at startup if it's not installed
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Dependencia 'reportlab' no instalada. Ejecuta 'pip install reportlab' y vuelve a desplegar.")
 
     # Crear PDF en memoria
     buffer = io.BytesIO()
