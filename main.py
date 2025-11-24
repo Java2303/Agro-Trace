@@ -7,6 +7,10 @@ import sqlite3
 import os
 from datetime import datetime
 import json
+import io
+from fastapi.responses import StreamingResponse
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 # Definición de Modelos Pydantic para la estructura de datos
 
@@ -262,6 +266,60 @@ def get_plot_history(plot_id: int, limit: int = 200):
         return entries
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# PDF Certificate
+# -----------------------
+@app.get('/plots/{plot_id}/certificate')
+def get_plot_certificate(plot_id: int):
+    """Genera un PDF simple con los detalles de la parcela (certificado).
+    Retorna el PDF como StreamingResponse.
+    """
+    plot = next((p for p in in_memory_db if p.id == plot_id), None)
+    if plot is None:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+
+    # Crear PDF en memoria
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # Header
+    c.setFont('Helvetica-Bold', 18)
+    c.drawString(48, height - 72, 'Certificado de Parcela - Agro Trace')
+
+    c.setFont('Helvetica', 11)
+    c.drawString(48, height - 100, f'ID Parcela: {plot.id}')
+    c.drawString(48, height - 118, f'Nombre: {plot.name}')
+    c.drawString(48, height - 136, f'Cultivo: {plot.crop_type}')
+    c.drawString(48, height - 154, f'Área (Ha): {plot.area_hectares:.2f}')
+    c.drawString(48, height - 172, f'Estado: {plot.status}')
+
+    if plot.ph_level is not None:
+        c.drawString(48, height - 190, f'pH: {plot.ph_level}')
+    if plot.nitrogen_level is not None:
+        c.drawString(48, height - 208, f'Nivel N: {plot.nitrogen_level}')
+
+    # Lista de coordenadas
+    c.drawString(48, height - 236, 'Coordenadas (lat, lng):')
+    y = height - 254
+    for coord in plot.coordinates:
+        line = f'- {coord.x:.6f}, {coord.y:.6f}'
+        c.drawString(64, y, line)
+        y -= 14
+        if y < 60:
+            c.showPage()
+            y = height - 60
+
+    # Footer
+    c.setFont('Helvetica-Oblique', 9)
+    c.drawString(48, 48, f'Generado: {datetime.utcnow().isoformat()} UTC')
+    c.save()
+
+    buffer.seek(0)
+    filename = f'certificado_parcela_{plot.id}.pdf'
+    return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 # -----------------------------------------------------
 # ENDPOINT DE SALUD
