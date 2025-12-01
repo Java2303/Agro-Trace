@@ -17,7 +17,9 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 
 # Cargar variables de entorno desde un archivo .env (para desarrollo local)
-load_dotenv(dotenv_path='database.env')
+# Solo cargar si DATABASE_URL no está ya definida (ej. por Render)
+if not os.getenv("DATABASE_URL"):
+    load_dotenv(dotenv_path='database.env')
 
 # MODELS
 class Coordinate(BaseModel):
@@ -142,9 +144,7 @@ class CertificateData(BaseModel):
 # --- Configuración de SQLAlchemy ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    # Si no se encuentra la variable de entorno, el programa se detendrá con un error claro.
-    # Esto previene que intente conectarse a localhost en producción.
-    raise RuntimeError("FATAL ERROR: La variable de entorno DATABASE_URL no está configurada.")
+    raise RuntimeError("DATABASE_URL no está configurada en el archivo .env")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
