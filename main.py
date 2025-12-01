@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import io
 from fastapi.responses import StreamingResponse
+import uuid
 from dotenv import load_dotenv
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
@@ -53,6 +54,7 @@ class PlotBase(BaseModel):
     name: str
     crop_type: str
     area_hectares: float
+    certification_standard: Optional[str] = None
     coordinates: List[Coordinate]
 
     # Validación: mínimo 3 vértices en coordinates
@@ -117,6 +119,26 @@ class Alert(BaseModel):
 class AlertResolve(BaseModel):
     is_resolved: bool
 
+class LandUseEventCreate(BaseModel):
+    plot_id: int
+    event_type: str = Field(..., description="Tipo de evento: SIEMBRA, FERTILIZACION, APLICACION_PESTICIDA, COSECHA, OTRO")
+    event_date: datetime
+    details: dict = Field(..., description="Detalles del evento en formato JSON")
+
+class LandUseEvent(LandUseEventCreate):
+    id: int
+    
+    class Config:
+        orm_mode = True
+
+class CertificateData(BaseModel):
+    id: int
+    uuid: uuid.UUID
+    plot_id: int
+    generated_at: datetime
+    class Config:
+        orm_mode = True
+
 # --- Configuración de SQLAlchemy ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -138,9 +160,11 @@ class PlotDB(Base):
     status = Column(String, default="PENDIENTE")
     ph_level = Column(Float, nullable=True)
     nitrogen_level = Column(Float, nullable=True)
+    certification_standard = Column(String, nullable=True)
     
     soil_analyses = relationship("SoilAnalysisDB", back_populates="plot", cascade="all, delete-orphan")
     alerts = relationship("AlertDB", back_populates="plot", cascade="all, delete-orphan")
+    land_use_events = relationship("LandUseEventDB", back_populates="plot", cascade="all, delete-orphan")
 
 class SoilAnalysisDB(Base):
     __tablename__ = "soil_analyses"
@@ -181,6 +205,24 @@ class AuditDB(Base):
     target_type = Column(String, nullable=True)
     target_id = Column(String, nullable=True)
     details = Column(JSONB, nullable=True)
+
+class LandUseEventDB(Base):
+    __tablename__ = "land_use_events"
+    id = Column(Integer, primary_key=True, index=True)
+    plot_id = Column(Integer, ForeignKey("plots.id"), nullable=False)
+    event_type = Column(String, index=True, nullable=False)
+    event_date = Column(DateTime(timezone=True), nullable=False)
+    details = Column(JSONB)
+
+    plot = relationship("PlotDB", back_populates="land_use_events")
+
+class CertificateDB(Base):
+    __tablename__ = "certificates"
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()))
+    plot_id = Column(Integer, ForeignKey("plots.id"), nullable=False)
+    generated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    snapshot_data = Column(JSONB) # Guarda una copia de los datos al momento de generar
 
 # --- Creación de Tablas ---
 def init_db():
@@ -384,6 +426,19 @@ def get_plot_history(plot_id: int, limit: int = 200, db: Session = Depends(get_d
     """Retorna el historial de auditoría para una parcela específica."""
     return db.query(AuditDB).filter(AuditDB.target_id == str(plot_id)).order_by(AuditDB.id.desc()).limit(limit).all()
 
+@app.post("/plots/{plot_id}/land_use_events", response_model=LandUseEvent, status_code=201)
+def create_land_use_event(plot_id: int, event: LandUseEventCreate, db: Session = Depends(get_db)):
+    """Registra un evento de uso de suelo (trazabilidad) para una parcela."""
+    if event.plot_id != plot_id:
+        raise HTTPException(status_code=400, detail="El plot_id en el cuerpo no coincide con el de la URL.")
+    
+    db_event = LandUseEventDB(**event.dict())
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    log_audit(db, action=f"REGISTRAR_EVENTO_{event.event_type}", target_type='parcela', target_id=str(plot_id), details=event.details)
+    return db_event
+
 @app.post("/plots/{plot_id}/soil_analyses", response_model=SoilAnalysisData, status_code=201)
 def create_manual_soil_analysis(plot_id: int, analysis_data: SoilAnalysisDataCreate, db: Session = Depends(get_db)):
     """
@@ -431,18 +486,53 @@ def get_plot_soil_analyses(plot_id: int, limit: int = 100, db: Session = Depends
     """
     return db.query(SoilAnalysisDB).filter(SoilAnalysisDB.plot_id == plot_id).order_by(SoilAnalysisDB.timestamp.desc()).limit(limit).all()
 
+@app.get("/plots/{plot_id}/land_use_events", response_model=List[LandUseEvent])
+def get_land_use_events(plot_id: int, limit: int = 200, db: Session = Depends(get_db)):
+    """Retorna el historial de uso de suelo para una parcela."""
+    plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+    return db.query(LandUseEventDB).filter(LandUseEventDB.plot_id == plot_id).order_by(LandUseEventDB.event_date.desc()).limit(limit).all()
+
 @app.get('/plots/{plot_id}/certificate')
 def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
     """Return PDF certificate for a plot."""
     plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
+    
+    # Dependencias para QR y PDF
+    try:
+        import qrcode
+        from qrcode.image.pil import PilImage
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.utils import ImageReader
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Dependencias 'reportlab' o 'qrcode' no instaladas.")
 
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas
     except ImportError:
         raise HTTPException(status_code=503, detail="Dependencia 'reportlab' no instalada.")
+
+    # Crear registro del certificado en la DB
+    snapshot = {
+        "plot_name": plot.name,
+        "crop_type": plot.crop_type,
+        "area": plot.area_hectares,
+        "status": plot.status,
+        "ph": plot.ph_level,
+        "nitrogen": plot.nitrogen_level,
+        "standard": plot.certification_standard
+    }
+    new_cert_db = CertificateDB(plot_id=plot.id, snapshot_data=snapshot)
+    db.add(new_cert_db)
+    db.commit()
+    db.refresh(new_cert_db)
+
+    verification_url = f"https://agro-trace.onrender.com/verify/certificate/{new_cert_db.uuid}"
 
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -456,6 +546,7 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
     c.drawString(48, height - 118, f'Nombre: {plot.name}')
     c.drawString(48, height - 136, f'Cultivo: {plot.crop_type}')
     c.drawString(48, height - 154, f'Área (Ha): {plot.area_hectares:.2f}')
+    c.drawString(48, height - 172, f'Estándar: {plot.certification_standard or "No especificado"}')
     c.drawString(48, height - 172, f'Estado: {plot.status}')
 
     latest_analysis = db.query(SoilAnalysisDB).filter(SoilAnalysisDB.plot_id == plot_id).order_by(SoilAnalysisDB.id.desc()).first()
@@ -483,6 +574,19 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
             c.showPage()
             y = height - 72
 
+    # Generar y añadir QR code
+    qr_img = qrcode.make(verification_url, image_factory=PilImage)
+    qr_buffer = io.BytesIO()
+    qr_img.save(qr_buffer, format='PNG')
+    qr_buffer.seek(0)
+    
+    qr_reader = ImageReader(qr_buffer)
+    # Dibujar el QR en la esquina inferior derecha
+    c.drawImage(qr_reader, width - 120, 48, width=80, height=80, mask='auto')
+    c.setFont('Helvetica', 8)
+    c.drawCentredString(width - 80, 40, "Verificar Autenticidad")
+
+
     c.setFont('Helvetica-Oblique', 9)
     c.drawString(48, 48, f'Generado: {datetime.now(timezone.utc).isoformat()} UTC')
     c.save()
@@ -490,6 +594,17 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
     buffer.seek(0)
     filename = f'certificado_parcela_{plot.id}.pdf'
     return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+
+@app.get("/verify/certificate/{cert_uuid}", response_model=CertificateData)
+def verify_certificate(cert_uuid: uuid.UUID, db: Session = Depends(get_db)):
+    """Endpoint público para verificar la autenticidad de un certificado por su UUID."""
+    certificate = db.query(CertificateDB).filter(CertificateDB.uuid == str(cert_uuid)).first()
+    if not certificate:
+        raise HTTPException(status_code=404, detail="Certificado no encontrado o inválido.")
+    
+    # En una app real, aquí devolverías una página HTML bonita con los detalles.
+    # Por ahora, devolvemos los datos del certificado.
+    return certificate
 
 @app.get("/alerts/", response_model=List[Alert])
 def get_all_active_alerts(limit: int = 100, db: Session = Depends(get_db)):
