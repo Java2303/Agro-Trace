@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
 
 # Cargar variables de entorno desde un archivo .env (para desarrollo local)
-load_dotenv()
+load_dotenv(dotenv_path='database.env')
 
 # MODELS
 class Coordinate(BaseModel):
@@ -120,6 +120,7 @@ class AlertResolve(BaseModel):
 # --- Configuración de SQLAlchemy ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
+    # Si no se encuentra la variable de entorno, el programa se detendrá.
     raise RuntimeError("DATABASE_URL no está configurada en el archivo .env")
 
 engine = create_engine(DATABASE_URL)
@@ -211,6 +212,7 @@ SOIL_THRESHOLDS = {
 origins = ["*"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+
 def log_audit(db: Session, action: str, target_type: Optional[str] = None, target_id: Optional[str] = None, details: Optional[dict] = None, actor: Optional[str] = None):
     audit_log = AuditDB(
         actor=actor or 'system',
@@ -221,6 +223,65 @@ def log_audit(db: Session, action: str, target_type: Optional[str] = None, targe
     )
     db.add(audit_log)
     db.commit()
+
+def check_for_alerts(db: Session, plot_id: int, analysis_data: SoilAnalysisDB, plot_crop_type: str):
+    """
+    Verifica si los resultados del análisis de suelo justifican la creación de una alerta.
+    """
+    crop_key = (plot_crop_type or '').strip().lower()
+    cfg = SOIL_THRESHOLDS.get(crop_key, SOIL_THRESHOLDS['default'])
+
+    alerts_to_add = []
+
+    # Alerta por pH anormal
+    if analysis_data.ph < cfg['pH_min'] - 0.5 or analysis_data.ph > cfg['pH_max'] + 0.5:
+        alerts_to_add.append(AlertDB(
+            plot_id=plot_id,
+            type='PH_ANORMAL',
+            message=f"pH ({analysis_data.ph}) muy fuera del rango óptimo ({cfg['pH_min']}-{cfg['pH_max']}) para {plot_crop_type}.",
+            severity='ALTA'
+        ))
+    elif analysis_data.ph < cfg['pH_min'] or analysis_data.ph > cfg['pH_max']:
+        alerts_to_add.append(AlertDB(
+            plot_id=plot_id,
+            type='PH_OBSERVADO',
+            message=f"pH ({analysis_data.ph}) ligeramente fuera del rango óptimo ({cfg['pH_min']}-{cfg['pH_max']}) para {plot_crop_type}.",
+            severity='MEDIA'
+        ))
+
+    # Alerta por deficiencia de Nitrógeno
+    if analysis_data.nitrogen < cfg['n_min'] * 0.7:
+        alerts_to_add.append(AlertDB(
+            plot_id=plot_id,
+            type='DEFICIENCIA_NITROGENO',
+            message=f"Nivel de Nitrógeno ({analysis_data.nitrogen} ppm) muy bajo para {plot_crop_type} (mínimo {cfg['n_min']} ppm).",
+            severity='ALTA'
+        ))
+    elif analysis_data.nitrogen < cfg['n_min']:
+        alerts_to_add.append(AlertDB(
+            plot_id=plot_id,
+            type='NITROGENO_BAJO',
+            message=f"Nivel de Nitrógeno ({analysis_data.nitrogen} ppm) bajo para {plot_crop_type} (mínimo {cfg['n_min']} ppm).",
+            severity='MEDIA'
+        ))
+
+    # Alerta por baja materia orgánica
+    if analysis_data.organic_matter is not None and analysis_data.organic_matter < cfg['mo_min'] * 0.8:
+        alerts_to_add.append(AlertDB(
+            plot_id=plot_id,
+            type='BAJA_MATERIA_ORGANICA',
+            message=f"Materia orgánica ({analysis_data.organic_matter}%) baja para {plot_crop_type} (mínimo {cfg['mo_min']}%).",
+            severity='MEDIA'
+        ))
+
+    if alerts_to_add:
+        db.add_all(alerts_to_add)
+        db.commit()
+        for alert in alerts_to_add:
+            db.refresh(alert)
+            log_audit(db, action='GENERAR_ALERTA', target_type='alerta', target_id=str(alert.id), details={'plot_id': plot_id, 'message': alert.message})
+
+    return alerts_to_add
 
 @app.get("/plots/", response_model=List[Plot])
 def list_plots(db: Session = Depends(get_db)):
@@ -292,8 +353,7 @@ def analyze_plot(plot_id: int, db: Session = Depends(get_db)):
         'status_result': analysis_result_status, 'applied_thresholds': cfg
     })
 
-    # check_for_alerts(db, new_soil_analysis_db, plot_to_analyze.crop_type)
-    
+    check_for_alerts(db, plot_id, new_soil_analysis_db, plot_to_analyze.crop_type)
     return new_soil_analysis_db
 
 @app.delete("/plots/{plot_id}", status_code=200)
@@ -323,6 +383,53 @@ def get_history(plot_id: Optional[int] = None, limit: int = 200, db: Session = D
 def get_plot_history(plot_id: int, limit: int = 200, db: Session = Depends(get_db)):
     """Retorna el historial de auditoría para una parcela específica."""
     return db.query(AuditDB).filter(AuditDB.target_id == str(plot_id)).order_by(AuditDB.id.desc()).limit(limit).all()
+
+@app.post("/plots/{plot_id}/soil_analyses", response_model=SoilAnalysisData, status_code=201)
+def create_manual_soil_analysis(plot_id: int, analysis_data: SoilAnalysisDataCreate, db: Session = Depends(get_db)):
+    """
+    Registra manualmente un análisis de suelo para una parcela (ej. datos de laboratorio).
+    """
+    if analysis_data.plot_id != plot_id:
+        raise HTTPException(status_code=400, detail="El plot_id en el cuerpo no coincide con el plot_id de la URL.")
+
+    plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+
+    crop_key = (plot.crop_type or '').strip().lower()
+    cfg = SOIL_THRESHOLDS.get(crop_key, SOIL_THRESHOLDS['default'])
+    
+    analysis_result_status = 'PENDIENTE'
+    if cfg['pH_min'] <= analysis_data.ph <= cfg['pH_max'] and analysis_data.nitrogen >= cfg['n_min']:
+        analysis_result_status = 'CERTIFICADO'
+    elif analysis_data.ph < cfg['pH_min'] or analysis_data.ph > cfg['pH_max']:
+        analysis_result_status = 'OBSERVADO'
+
+    new_analysis_db = SoilAnalysisDB(
+        **analysis_data.dict(),
+        status_at_analysis=plot.status,
+        analysis_result_status=analysis_result_status
+    )
+    db.add(new_analysis_db)
+    
+    plot.status = analysis_result_status
+    plot.ph_level = analysis_data.ph
+    plot.nitrogen_level = analysis_data.nitrogen
+    
+    db.commit()
+    db.refresh(new_analysis_db)
+
+    log_audit(db, action='REGISTRAR_ANALISIS_MANUAL', target_type='parcela', target_id=str(plot_id), details={'analysis_id': new_analysis_db.id, 'ph': new_analysis_db.ph, 'nitrogen': new_analysis_db.nitrogen})
+    check_for_alerts(db, plot_id, new_analysis_db, plot.crop_type)
+
+    return new_analysis_db
+
+@app.get("/plots/{plot_id}/soil_analyses", response_model=List[SoilAnalysisData])
+def get_plot_soil_analyses(plot_id: int, limit: int = 100, db: Session = Depends(get_db)):
+    """
+    Retorna el historial de análisis de suelo para una parcela (línea de tiempo).
+    """
+    return db.query(SoilAnalysisDB).filter(SoilAnalysisDB.plot_id == plot_id).order_by(SoilAnalysisDB.timestamp.desc()).limit(limit).all()
 
 @app.get('/plots/{plot_id}/certificate')
 def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
@@ -383,6 +490,29 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
     buffer.seek(0)
     filename = f'certificado_parcela_{plot.id}.pdf'
     return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+
+@app.get("/alerts/", response_model=List[Alert])
+def get_all_active_alerts(limit: int = 100, db: Session = Depends(get_db)):
+    """Retorna todas las alertas activas en el sistema."""
+    return db.query(AlertDB).filter(AlertDB.is_resolved == False).order_by(AlertDB.timestamp.desc()).limit(limit).all()
+
+@app.get("/plots/{plot_id}/alerts", response_model=List[Alert])
+def get_plot_alerts(plot_id: int, resolved: Optional[bool] = False, limit: int = 100, db: Session = Depends(get_db)):
+    """Retorna las alertas para una parcela específica, filtrando por estado de resolución."""
+    plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
+    if not plot:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+    return db.query(AlertDB).filter(AlertDB.plot_id == plot_id, AlertDB.is_resolved == resolved).order_by(AlertDB.timestamp.desc()).limit(limit).all()
+
+@app.put("/alerts/{alert_id}/resolve", status_code=200)
+def resolve_alert(alert_id: int, resolution: AlertResolve, db: Session = Depends(get_db)):
+    """Marca una alerta como resuelta o no resuelta."""
+    alert_to_update = db.query(AlertDB).filter(AlertDB.id == alert_id).first()
+    if not alert_to_update:
+        raise HTTPException(status_code=404, detail="Alerta no encontrada")
+    alert_to_update.is_resolved = resolution.is_resolved
+    db.commit()
+    return {"message": f"Alerta {alert_id} actualizada a resuelta: {resolution.is_resolved}"}
 
 @app.get("/")
 def read_root():
