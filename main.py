@@ -142,8 +142,9 @@ class CertificateData(BaseModel):
 # --- Configuración de SQLAlchemy ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    # Si no se encuentra la variable de entorno, el programa se detendrá.
-    raise RuntimeError("DATABASE_URL no está configurada en el archivo .env")
+    # Si no se encuentra la variable de entorno, el programa se detendrá con un error claro.
+    # Esto previene que intente conectarse a localhost en producción.
+    raise RuntimeError("FATAL ERROR: La variable de entorno DATABASE_URL no está configurada.")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
