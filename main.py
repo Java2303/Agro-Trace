@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 # Cargar variables de entorno desde un archivo .env (para desarrollo local)
 # Solo cargar si DATABASE_URL no está ya definida (ej. por Render)
-if not os.getenv("DATABASE_URL"):
+if "DATABASE_URL" not in os.environ:
     load_dotenv(dotenv_path='database.env')
 
 # MODELS
@@ -144,9 +144,10 @@ class CertificateData(BaseModel):
 # --- Configuración de SQLAlchemy ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL no está configurada en el archivo .env")
-
-engine = create_engine(DATABASE_URL)
+    raise RuntimeError("FATAL ERROR: La variable de entorno DATABASE_URL no está configurada.")
+ 
+# Forzar el uso de SSL para la conexión a PostgreSQL, necesario en Render
+engine = create_engine(DATABASE_URL, connect_args={"sslmode": "require"} if DATABASE_URL.startswith("postgresql://") else {})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
