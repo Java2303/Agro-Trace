@@ -1,14 +1,22 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, Field
+from typing import List, Optional, Generator
 import random
-import sqlite3
 import os
 from datetime import datetime, timezone
 import json
 import io
 from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.dialects.postgresql import JSONB
+
+# Cargar variables de entorno desde un archivo .env (para desarrollo local)
+load_dotenv()
 
 # MODELS
 class Coordinate(BaseModel):
@@ -71,11 +79,39 @@ class Plot(PlotBase):
     ph_level: Optional[float] = None
     nitrogen_level: Optional[float] = None
 
-# IN-MEMORY DB
-in_memory_db: List[Plot] = []
-next_plot_id = 1
+class SoilAnalysisDataCreate(BaseModel):
+    plot_id: int
+    ph: float = Field(..., ge=0.0, le=14.0, description="Nivel de pH del suelo (0-14)")
+    nitrogen: float = Field(..., ge=0.0, description="Nivel de Nitrógeno (N) en ppm")
+    phosphorus: Optional[float] = Field(None, ge=0.0, description="Nivel de Fósforo (P) en ppm")
+    potassium: Optional[float] = Field(None, ge=0.0, description="Nivel de Potasio (K) en ppm")
+    organic_matter: Optional[float] = Field(None, ge=0.0, le=100.0, description="Materia Orgánica (%)")
+    texture: Optional[str] = Field(None, description="Textura del suelo (ej. 'arenoso', 'arcilloso', 'limoso')")
+    density: Optional[float] = Field(None, ge=0.0, description="Densidad aparente (g/cm³)")
+    electrical_conductivity: Optional[float] = Field(None, ge=0.0, description="Conductividad eléctrica (dS/m)")
+
+class SoilAnalysisData(SoilAnalysisDataCreate):
+    id: int
+    timestamp: datetime
+    status_at_analysis: str # Estado de la parcela cuando se registró este análisis
+    analysis_result_status: str # Estado de certificación derivado de este análisis
+
+class Alert(BaseModel):
+    id: int
+    plot_id: int
+    timestamp: datetime
+    type: str # e.g., "DEGRADACION", "EXCESO_USO", "PH_ANORMAL", "DEFICIENCIA_NITROGENO"
+    message: str
+    severity: str # e.g., "BAJA", "MEDIA", "ALTA"
+    is_resolved: bool = False
+
+class AlertResolve(BaseModel):
+    is_resolved: bool
 
 app = FastAPI(title="Agro Trace API")
+
+# --- Configuración de Umbrales (ahora centralizada) ---
+SOIL_THRESHOLDS = {} # Se cargará en init_db
 
 # CORS (DEV)
 origins = ["*"]
@@ -261,12 +297,54 @@ def get_plot_history(plot_id: int, limit: int = 200):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- Nuevos Endpoints para Información Edáfica y Agronómica ---
+
+@app.post("/plots/{plot_id}/soil_analyses", response_model=SoilAnalysisData, status_code=201)
+def create_manual_soil_analysis(plot_id: int, analysis_data: SoilAnalysisDataCreate):
+    """
+    Registra manualmente un análisis de suelo para una parcela.
+    """
+    if analysis_data.plot_id != plot_id:
+        raise HTTPException(status_code=400, detail="El plot_id en el cuerpo no coincide con el plot_id de la URL.")
+
+    plot = db_get_plot_by_id(plot_id)
+    if plot is None:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+
+    # Determinar el estado de certificación basado en los umbrales para este análisis
+    crop_key = (plot.crop_type or '').strip().lower()
+    cfg = SOIL_THRESHOLDS.get(crop_key, SOIL_THRESHOLDS['default'])
+    
+    analysis_result_status = 'PENDIENTE'
+    if cfg['pH_min'] <= analysis_data.ph <= cfg['pH_max'] and analysis_data.nitrogen >= cfg['n_min']:
+        analysis_result_status = 'CERTIFICADO'
+    elif analysis_data.ph < cfg['pH_min'] or analysis_data.ph > cfg['pH_max']:
+        analysis_result_status = 'OBSERVADO'
+
+    new_analysis = db_create_soil_analysis(analysis_data, plot.status, analysis_result_status)
+    db_update_plot_summary_analysis(plot_id, analysis_result_status, analysis_data.ph, analysis_data.nitrogen)
+
+    log_audit(action='REGISTRAR_ANALISIS_MANUAL', target_type='parcela', target_id=str(plot_id), details={'analysis_id': new_analysis.id, 'ph': new_analysis.ph, 'nitrogen': new_analysis.nitrogen})
+    check_for_alerts(plot_id, new_analysis, plot.crop_type)
+
+    return new_analysis
+
+@app.get("/plots/{plot_id}/soil_analyses", response_model=List[SoilAnalysisData])
+def get_plot_soil_analyses(plot_id: int, limit: int = 100):
+    """
+    Retorna el historial de análisis de suelo para una parcela específica.
+    Esto sirve como base para "gráficos de evolución".
+    """
+    if db_get_plot_by_id(plot_id) is None:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+    return db_get_soil_analyses_for_plot(plot_id, limit)
+
 
 # PDF Certificate
 @app.get('/plots/{plot_id}/certificate')
 def get_plot_certificate(plot_id: int):
     """Return PDF certificate for a plot."""
-    plot = next((p for p in in_memory_db if p.id == plot_id), None)
+    plot = db_get_plot_by_id(plot_id) # Usa la función de DB
     if plot is None:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
 
@@ -293,19 +371,60 @@ def get_plot_certificate(plot_id: int):
     c.drawString(48, height - 154, f'Área (Ha): {plot.area_hectares:.2f}')
     c.drawString(48, height - 172, f'Estado: {plot.status}')
 
-    if plot.ph_level is not None:
-        c.drawString(48, height - 190, f'pH: {plot.ph_level}')
-    if plot.nitrogen_level is not None:
-        c.drawString(48, height - 208, f'Nivel N: {plot.nitrogen_level}')
+    # Obtener el último análisis de suelo para el certificado
+    latest_analysis = None
+    analyses = db_get_soil_analyses_for_plot(plot_id, limit=1)
+    if analyses:
+        latest_analysis = analyses[0]
+
+    # Mostrar el último análisis de suelo en el certificado
+    c.setFont('Helvetica-Bold', 11)
+    c.drawString(48, height - 200, 'Último Análisis de Suelo:')
+    c.setFont('Helvetica', 11)
+    if latest_analysis:
+        c.drawString(48, height - 218, f'Fecha: {latest_analysis.timestamp.strftime("%Y-%m-%d %H:%M")}')
+        c.drawString(48, height - 236, f'pH: {latest_analysis.ph}')
+        c.drawString(48, height - 254, f'Nitrógeno: {latest_analysis.nitrogen} ppm')
+        if latest_analysis.phosphorus is not None:
+            c.drawString(48, height - 272, f'Fósforo: {latest_analysis.phosphorus} ppm')
+        if latest_analysis.potassium is not None:
+            c.drawString(48, height - 290, f'Potasio: {latest_analysis.potassium} ppm')
+        if latest_analysis.organic_matter is not None:
+            c.drawString(48, height - 308, f'Materia Orgánica: {latest_analysis.organic_matter}%')
+        # Ajustar la posición Y para las coordenadas después de los detalles del análisis
+        y_coords_start = height - 326
+    else:
+        c.drawString(48, height - 218, 'No hay análisis de suelo registrados.')
+        y_coords_start = height - 236
 
     # Lista de coordenadas
-    c.drawString(48, height - 236, 'Coordenadas (lat, lng):')
-    y = height - 254
+    c.drawString(48, y_coords_start, 'Coordenadas (lat, lng):')
+    y = y_coords_start - 18
     for coord in plot.coordinates:
         line = f'- {coord.x:.6f}, {coord.y:.6f}'
         c.drawString(64, y, line)
         y -= 14
-        if y < 60:
+        if y < 100: # Ajustar el límite para que no se superponga con el footer
+            c.showPage()
+            y = height - 72 # Reiniciar posición Y en nueva página
+
+    # Sección de Alertas (opcional, si quieres incluirlas en el certificado)
+    active_alerts = db_get_alerts(plot_id=plot_id, resolved=False, limit=5) # Limitar a 5 alertas para no saturar
+    if active_alerts:
+        c.setFont('Helvetica-Bold', 11)
+        c.drawString(48, y - 20, 'Alertas Activas (últimas 5):')
+        y -= 38
+        c.setFont('Helvetica', 10)
+        for alert in active_alerts:
+            line = f'- [{alert.severity}] {alert.type}: {alert.message} ({alert.timestamp.strftime("%Y-%m-%d")})'
+            c.drawString(64, y, line)
+            y -= 14
+            if y < 100:
+                c.showPage()
+                y = height - 72
+
+    # Asegurarse de que el footer no se superponga si la lista de coordenadas es muy larga
+    if y < 60: # Si el contenido llega muy abajo, añadir una nueva página antes del footer
             c.showPage()
             y = height - 60
 
@@ -318,6 +437,26 @@ def get_plot_certificate(plot_id: int):
     filename = f'certificado_parcela_{plot.id}.pdf'
     return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
+# --- Endpoints para Alertas ---
+
+@app.get("/alerts/", response_model=List[Alert])
+def get_all_active_alerts(limit: int = 100):
+    """Retorna todas las alertas activas en el sistema."""
+    return db_get_alerts(resolved=False, limit=limit)
+
+@app.get("/plots/{plot_id}/alerts", response_model=List[Alert])
+def get_plot_alerts(plot_id: int, resolved: Optional[bool] = False, limit: int = 100):
+    """Retorna las alertas para una parcela específica."""
+    if db_get_plot_by_id(plot_id) is None:
+        raise HTTPException(status_code=404, detail="Parcela no encontrada")
+    return db_get_alerts(plot_id=plot_id, resolved=resolved, limit=limit)
+
+@app.put("/alerts/{alert_id}/resolve", response_model=Alert)
+def resolve_alert(alert_id: int, resolution: AlertResolve):
+    """Marca una alerta como resuelta o no resuelta."""
+    db_resolve_alert(alert_id, resolution.is_resolved) # Actualiza el estado en la DB
+    # Retornar un mensaje de éxito, el response_model se ajusta a dict
+    return {"message": f"Alerta {alert_id} actualizada a resuelta: {resolution.is_resolved}"} 
 # -----------------------------------------------------
 # ENDPOINT DE SALUD
 # -----------------------------------------------------
