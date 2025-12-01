@@ -4,3 +4,4 @@ reportlab
 psycopg2-binary
 SQLAlchemy
 python-dotenv
+qrcode[pil]
