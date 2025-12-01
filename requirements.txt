@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 pydantic
 reportlab
+psycopg2-binary
+SQLAlchemy
+python-dotenv
