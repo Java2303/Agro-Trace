@@ -1,6 +1,5 @@
 fastapi
-uvicorn[standard]
-pydantic
+uvicorn
 reportlab
 psycopg2-binary
 SQLAlchemy
