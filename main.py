@@ -1,15 +1,22 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
-from typing import List, Optional, Generator
+from typing import List, Optional, Generator, Annotated
 import random
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 import io
 from fastapi.responses import StreamingResponse
 import uuid
 from dotenv import load_dotenv
+
+# --- Módulo de Seguridad ---
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+# --- Fin Módulo de Seguridad ---
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
@@ -18,6 +25,20 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 # Cargar variables de entorno desde un archivo .env (para desarrollo local)
 # Solo cargar si DATABASE_URL no está ya definida (ej. por Render)
+
+# --- CONFIGURACIÓN DE SEGURIDAD ---
+SECRET_KEY = os.getenv("SECRET_KEY", "a_very_secret_key_that_should_be_in_env") # ¡Cambia esto en producción!
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 24 horas
+
+# Contexto para hashing de contraseñas
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Esquema OAuth2
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# --- FIN CONFIGURACIÓN DE SEGURIDAD ---
+
 if "DATABASE_URL" not in os.environ:
     load_dotenv(dotenv_path='database.env')
 
@@ -141,6 +162,27 @@ class CertificateData(BaseModel):
     class Config:
         orm_mode = True
 
+class UserBase(BaseModel):
+    email: str = Field(..., example="user@example.com")
+    full_name: str = Field(..., example="Juan Pérez")
+
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=8)
+    role: str = Field("productor", enum=["productor", "tecnico", "certificador", "administrador"])
+
+class User(UserBase):
+    id: int
+    role: str
+    is_active: bool
+
+    class Config:
+        orm_mode = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
 # --- Configuración de SQLAlchemy ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -167,6 +209,16 @@ class PlotDB(Base):
     soil_analyses = relationship("SoilAnalysisDB", back_populates="plot", cascade="all, delete-orphan")
     alerts = relationship("AlertDB", back_populates="plot", cascade="all, delete-orphan")
     land_use_events = relationship("LandUseEventDB", back_populates="plot", cascade="all, delete-orphan")
+    certificates = relationship("CertificateDB", back_populates="plot", cascade="all, delete-orphan")
+
+class UserDB(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    full_name = Column(String)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="productor") # productor, tecnico, certificador, administrador
+    is_active = Column(Boolean, default=True)
 
 class SoilAnalysisDB(Base):
     __tablename__ = "soil_analyses"
@@ -221,10 +273,12 @@ class LandUseEventDB(Base):
 class CertificateDB(Base):
     __tablename__ = "certificates"
     id = Column(Integer, primary_key=True, index=True)
-    uuid = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()))
-    plot_id = Column(Integer, ForeignKey("plots.id"), nullable=False)
+    uuid = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()), nullable=False)
+    plot_id = Column(Integer, ForeignKey("plots.id", ondelete="CASCADE"), nullable=False)
     generated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     snapshot_data = Column(JSONB) # Guarda una copia de los datos al momento de generar
+
+    plot = relationship("PlotDB", back_populates="certificates")
 
 # --- Creación de Tablas ---
 def init_db():
@@ -242,6 +296,31 @@ def get_db() -> Generator[Session, None, None]:
 
 app = FastAPI(title="Agro Trace API")
 
+# --- FUNCIONES DE SEGURIDAD ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user(db: Session, email: str):
+    return db.query(UserDB).filter(UserDB.email == email).first()
+
+def authenticate_user(db: Session, email: str, password: str):
+    user = get_user(db, email)
+    if not user or not verify_password(password, user.hashed_password):
+        return False
+    return user
 # --- Configuración de Umbrales ---
 SOIL_THRESHOLDS = {
     'default': {'pH_min': 5.8, 'pH_max': 7.2, 'n_min': 150, 'p_min': 20, 'k_min': 150, 'mo_min': 1.5},
@@ -255,6 +334,25 @@ SOIL_THRESHOLDS = {
 # CORS (DEV)
 origins = ["*"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# --- Dependencia para obtener el usuario actual ---
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="No se pudieron validar las credenciales",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(db, email=email)
+    if user is None:
+        raise credentials_exception
+    return user
 
 
 def log_audit(db: Session, action: str, target_type: Optional[str] = None, target_id: Optional[str] = None, details: Optional[dict] = None, actor: Optional[str] = None):
@@ -327,14 +425,51 @@ def check_for_alerts(db: Session, plot_id: int, analysis_data: SoilAnalysisDB, p
 
     return alerts_to_add
 
+# --- ENDPOINTS DE AUTENTICACIÓN Y USUARIOS ---
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()], db: Session = Depends(get_db)):
+    user = authenticate_user(db, email=form_data.username, password=form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Email o contraseña incorrectos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/users/register", response_model=User, status_code=201)
+def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
+    db_user = get_user(db, email=user_data.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="El email ya está registrado")
+    hashed_password = get_password_hash(user_data.password)
+    db_user = UserDB(
+        email=user_data.email,
+        full_name=user_data.full_name,
+        hashed_password=hashed_password,
+        role=user_data.role
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.get("/users/me", response_model=User)
+async def read_users_me(current_user: Annotated[User, Depends(get_current_user)]):
+    return current_user
+
+# --- ENDPOINTS DE PARCELAS (Ahora protegidos) ---
+
 @app.get("/plots/", response_model=List[Plot])
-def list_plots(db: Session = Depends(get_db)):
+def list_plots(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Retorna la lista completa de parcelas registradas en Agro Trace."""
     plots = db.query(PlotDB).order_by(PlotDB.id.desc()).all()
     return plots
 
 @app.post("/plots/", response_model=Plot, status_code=201)
-def create_plot(plot_data: PlotBase, db: Session = Depends(get_db)):
+def create_plot(plot_data: PlotBase, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Crea una nueva parcela con el polígono georreferenciado."""
     coordinates_json = [c.dict() for c in plot_data.coordinates]
     new_plot_db = PlotDB(**plot_data.dict(exclude={'coordinates'}), coordinates=coordinates_json)
@@ -342,7 +477,7 @@ def create_plot(plot_data: PlotBase, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_plot_db)
 
-    log_audit(db, action='CREAR_PARCELA', target_type='parcela', target_id=str(new_plot_db.id), details={
+    log_audit(db, actor=current_user.email, action='CREAR_PARCELA', target_type='parcela', target_id=str(new_plot_db.id), details={
         'name': new_plot_db.name,
         'crop_type': new_plot_db.crop_type,
         'area_hectares': new_plot_db.area_hectares
@@ -351,7 +486,7 @@ def create_plot(plot_data: PlotBase, db: Session = Depends(get_db)):
     return new_plot_db
 
 @app.post("/plots/{plot_id}/analyze", response_model=SoilAnalysisData)
-def analyze_plot(plot_id: int, db: Session = Depends(get_db)):
+def analyze_plot(plot_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Simula un análisis geofísico y actualiza el estado de la parcela."""
     plot_to_analyze = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot_to_analyze:
@@ -392,7 +527,7 @@ def analyze_plot(plot_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_soil_analysis_db)
 
-    log_audit(db, action='ANALIZAR_SUELO', target_type='parcela', target_id=str(plot_id), details={
+    log_audit(db, actor=current_user.email, action='ANALIZAR_SUELO', target_type='parcela', target_id=str(plot_id), details={
         'analysis_id': new_soil_analysis_db.id, 'ph': ph, 'nitrogen': nitrogen,
         'status_result': analysis_result_status, 'applied_thresholds': cfg
     })
@@ -401,13 +536,13 @@ def analyze_plot(plot_id: int, db: Session = Depends(get_db)):
     return new_soil_analysis_db
 
 @app.delete("/plots/{plot_id}", status_code=200)
-def delete_plot(plot_id: int, db: Session = Depends(get_db)):
+def delete_plot(plot_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Elimina una parcela por su ID."""
     plot_to_delete = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot_to_delete:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
 
-    log_audit(db, action='ELIMINAR_PARCELA', target_type='parcela', target_id=str(plot_id), details={
+    log_audit(db, actor=current_user.email, action='ELIMINAR_PARCELA', target_type='parcela', target_id=str(plot_id), details={
         'name': plot_to_delete.name, 'crop_type': plot_to_delete.crop_type
     })
 
@@ -416,7 +551,7 @@ def delete_plot(plot_id: int, db: Session = Depends(get_db)):
     return {"message": f"Parcela {plot_id} eliminada correctamente."}
 
 @app.get('/history')
-def get_history(plot_id: Optional[int] = None, limit: int = 200, db: Session = Depends(get_db)):
+def get_history(plot_id: Optional[int] = None, limit: int = 200, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Retorna las entradas de auditoría. Opcionalmente filtra por `plot_id`."""
     query = db.query(AuditDB).order_by(AuditDB.id.desc())
     if plot_id is not None:
@@ -424,12 +559,12 @@ def get_history(plot_id: Optional[int] = None, limit: int = 200, db: Session = D
     return query.limit(limit).all()
 
 @app.get('/plots/{plot_id}/history')
-def get_plot_history(plot_id: int, limit: int = 200, db: Session = Depends(get_db)):
+def get_plot_history(plot_id: int, limit: int = 200, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Retorna el historial de auditoría para una parcela específica."""
     return db.query(AuditDB).filter(AuditDB.target_id == str(plot_id)).order_by(AuditDB.id.desc()).limit(limit).all()
 
 @app.post("/plots/{plot_id}/land_use_events", response_model=LandUseEvent, status_code=201)
-def create_land_use_event(plot_id: int, event: LandUseEventCreate, db: Session = Depends(get_db)):
+def create_land_use_event(plot_id: int, event: LandUseEventCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Registra un evento de uso de suelo (trazabilidad) para una parcela."""
     if event.plot_id != plot_id:
         raise HTTPException(status_code=400, detail="El plot_id en el cuerpo no coincide con el de la URL.")
@@ -438,11 +573,11 @@ def create_land_use_event(plot_id: int, event: LandUseEventCreate, db: Session =
     db.add(db_event)
     db.commit()
     db.refresh(db_event)
-    log_audit(db, action=f"REGISTRAR_EVENTO_{event.event_type}", target_type='parcela', target_id=str(plot_id), details=event.details)
+    log_audit(db, actor=current_user.email, action=f"REGISTRAR_EVENTO_{event.event_type}", target_type='parcela', target_id=str(plot_id), details=event.details)
     return db_event
 
 @app.post("/plots/{plot_id}/soil_analyses", response_model=SoilAnalysisData, status_code=201)
-def create_manual_soil_analysis(plot_id: int, analysis_data: SoilAnalysisDataCreate, db: Session = Depends(get_db)):
+def create_manual_soil_analysis(plot_id: int, analysis_data: SoilAnalysisDataCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """
     Registra manualmente un análisis de suelo para una parcela (ej. datos de laboratorio).
     """
@@ -476,20 +611,20 @@ def create_manual_soil_analysis(plot_id: int, analysis_data: SoilAnalysisDataCre
     db.commit()
     db.refresh(new_analysis_db)
 
-    log_audit(db, action='REGISTRAR_ANALISIS_MANUAL', target_type='parcela', target_id=str(plot_id), details={'analysis_id': new_analysis_db.id, 'ph': new_analysis_db.ph, 'nitrogen': new_analysis_db.nitrogen})
+    log_audit(db, actor=current_user.email, action='REGISTRAR_ANALISIS_MANUAL', target_type='parcela', target_id=str(plot_id), details={'analysis_id': new_analysis_db.id, 'ph': new_analysis_db.ph, 'nitrogen': new_analysis_db.nitrogen})
     check_for_alerts(db, plot_id, new_analysis_db, plot.crop_type)
 
     return new_analysis_db
 
 @app.get("/plots/{plot_id}/soil_analyses", response_model=List[SoilAnalysisData])
-def get_plot_soil_analyses(plot_id: int, limit: int = 100, db: Session = Depends(get_db)):
+def get_plot_soil_analyses(plot_id: int, limit: int = 100, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """
     Retorna el historial de análisis de suelo para una parcela (línea de tiempo).
     """
     return db.query(SoilAnalysisDB).filter(SoilAnalysisDB.plot_id == plot_id).order_by(SoilAnalysisDB.timestamp.desc()).limit(limit).all()
 
 @app.get("/plots/{plot_id}/land_use_events", response_model=List[LandUseEvent])
-def get_land_use_events(plot_id: int, limit: int = 200, db: Session = Depends(get_db)):
+def get_land_use_events(plot_id: int, limit: int = 200, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Retorna el historial de uso de suelo para una parcela."""
     plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot:
@@ -497,7 +632,7 @@ def get_land_use_events(plot_id: int, limit: int = 200, db: Session = Depends(ge
     return db.query(LandUseEventDB).filter(LandUseEventDB.plot_id == plot_id).order_by(LandUseEventDB.event_date.desc()).limit(limit).all()
 
 @app.get('/plots/{plot_id}/certificate')
-def get_plot_certificate(plot_id: int, db: Session = Depends(get_db)):
+def get_plot_certificate(plot_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Return PDF certificate for a plot."""
     plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot:
@@ -609,12 +744,12 @@ def verify_certificate(cert_uuid: uuid.UUID, db: Session = Depends(get_db)):
     return certificate
 
 @app.get("/alerts/", response_model=List[Alert])
-def get_all_active_alerts(limit: int = 100, db: Session = Depends(get_db)):
+def get_all_active_alerts(limit: int = 100, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Retorna todas las alertas activas en el sistema."""
     return db.query(AlertDB).filter(AlertDB.is_resolved == False).order_by(AlertDB.timestamp.desc()).limit(limit).all()
 
 @app.get("/plots/{plot_id}/alerts", response_model=List[Alert])
-def get_plot_alerts(plot_id: int, resolved: Optional[bool] = False, limit: int = 100, db: Session = Depends(get_db)):
+def get_plot_alerts(plot_id: int, resolved: Optional[bool] = False, limit: int = 100, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Retorna las alertas para una parcela específica, filtrando por estado de resolución."""
     plot = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot:
@@ -622,7 +757,7 @@ def get_plot_alerts(plot_id: int, resolved: Optional[bool] = False, limit: int =
     return db.query(AlertDB).filter(AlertDB.plot_id == plot_id, AlertDB.is_resolved == resolved).order_by(AlertDB.timestamp.desc()).limit(limit).all()
 
 @app.put("/alerts/{alert_id}/resolve", status_code=200)
-def resolve_alert(alert_id: int, resolution: AlertResolve, db: Session = Depends(get_db)):
+def resolve_alert(alert_id: int, resolution: AlertResolve, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Marca una alerta como resuelta o no resuelta."""
     alert_to_update = db.query(AlertDB).filter(AlertDB.id == alert_id).first()
     if not alert_to_update:
