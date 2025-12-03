@@ -640,17 +640,13 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db), current_us
     try:
         import qrcode
         from qrcode.image.pil import PilImage
+        from svglib.svglib import svg2rlg
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas
         from reportlab.lib.utils import ImageReader
+        from reportlab.lib import colors
     except ImportError:
-        raise HTTPException(status_code=503, detail="Dependencias 'reportlab' o 'qrcode' no instaladas.")
-
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-    except ImportError:
-        raise HTTPException(status_code=503, detail="Dependencia 'reportlab' no instalada.")
+        raise HTTPException(status_code=503, detail="Dependencias 'reportlab', 'qrcode' o 'svglib' no instaladas.")
 
     # Crear registro del certificado en la DB
     snapshot = {
@@ -672,42 +668,67 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db), current_us
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
+    
+    # --- Colores y Estilos ---
+    COLOR_PRIMARY = colors.HexColor('#065F46') # Verde oscuro
+    COLOR_SECONDARY = colors.HexColor('#10B981') # Verde brillante
+    COLOR_TEXT = colors.HexColor('#1F2937') # Gris oscuro
+    COLOR_LIGHT_TEXT = colors.HexColor('#6B7280') # Gris claro
 
-    c.setFont('Helvetica-Bold', 18)
-    c.drawString(48, height - 72, 'Certificado de Parcela - Agro Trace')
+    # --- Cabecera ---
+    c.setFillColor(COLOR_PRIMARY)
+    c.rect(0, height - 100, width, 100, stroke=0, fill=1)
+    
+    # Logo (usando svglib para leer el SVG)
+    try:
+        logo = svg2rlg("assets/logo2.svg")
+        logo.width, logo.height = 60, 60
+        logo.drawOn(c, 40, height - 80)
+    except Exception as e:
+        print(f"Error al cargar el logo SVG: {e}")
+        c.setFont('Helvetica-Bold', 20)
+        c.setFillColor(colors.white)
+        c.drawString(40, height - 65, "Agro Trace")
 
-    c.setFont('Helvetica', 11)
-    c.drawString(48, height - 100, f'ID Parcela: {plot.id}')
-    c.drawString(48, height - 118, f'Nombre: {plot.name}')
-    c.drawString(48, height - 136, f'Cultivo: {plot.crop_type}')
-    c.drawString(48, height - 154, f'Área (Ha): {plot.area_hectares:.2f}')
-    c.drawString(48, height - 172, f'Estándar: {plot.certification_standard or "No especificado"}')
-    c.drawString(48, height - 172, f'Estado: {plot.status}')
+    c.setFont('Helvetica-Bold', 24)
+    c.setFillColor(colors.white)
+    c.drawRightString(width - 40, height - 65, 'Certificado de Parcela')
 
+    # --- Contenido Principal ---
+    y_pos = height - 140
+    c.setFillColor(COLOR_TEXT)
+    
+    def draw_field(label, value, y):
+        c.setFont('Helvetica-Bold', 12)
+        c.drawString(50, y, label)
+        c.setFont('Helvetica', 12)
+        c.drawString(200, y, str(value))
+        return y - 25
+
+    y_pos = draw_field('ID de Parcela:', plot.id, y_pos)
+    y_pos = draw_field('Nombre de Parcela:', plot.name, y_pos)
+    y_pos = draw_field('Tipo de Cultivo:', plot.crop_type, y_pos)
+    y_pos = draw_field('Área:', f"{plot.area_hectares:.2f} Ha", y_pos)
+    y_pos = draw_field('Estándar de Certificación:', plot.certification_standard or "No especificado", y_pos)
+    y_pos = draw_field('Estado Actual:', plot.status, y_pos)
+
+    y_pos -= 15 # Espacio extra
+    c.setStrokeColor(COLOR_SECONDARY)
+    c.line(50, y_pos, width - 50, y_pos)
+    y_pos -= 30
+
+    c.setFont('Helvetica-Bold', 14)
+    c.drawString(50, y_pos, 'Resultados del Último Análisis')
+    y_pos -= 25
+    
     latest_analysis = db.query(SoilAnalysisDB).filter(SoilAnalysisDB.plot_id == plot_id).order_by(SoilAnalysisDB.id.desc()).first()
-
-    c.setFont('Helvetica-Bold', 11)
-    c.drawString(48, height - 200, 'Último Análisis de Suelo:')
-    c.setFont('Helvetica', 11)
     if latest_analysis:
-        c.drawString(48, height - 218, f'Fecha: {latest_analysis.timestamp.strftime("%Y-%m-%d %H:%M")}')
-        c.drawString(48, height - 236, f'pH: {latest_analysis.ph}')
-        c.drawString(48, height - 254, f'Nitrógeno: {latest_analysis.nitrogen} ppm')
-        y_coords_start = height - 272
+        y_pos = draw_field('Fecha de Análisis:', latest_analysis.timestamp.strftime("%d/%m/%Y %H:%M"), y_pos)
+        y_pos = draw_field('Nivel de pH:', latest_analysis.ph, y_pos)
+        y_pos = draw_field('Nivel de Nitrógeno:', f"{latest_analysis.nitrogen} ppm", y_pos)
     else:
-        c.drawString(48, height - 218, 'No hay análisis de suelo registrados.')
-        y_coords_start = height - 236
-
-    c.drawString(48, y_coords_start, 'Coordenadas (lat, lng):')
-    y = y_coords_start - 18
-    coordinates = plot.coordinates if isinstance(plot.coordinates, list) else []
-    for coord in coordinates:
-        line = f'- {coord.get("x", 0):.6f}, {coord.get("y", 0):.6f}'
-        c.drawString(64, y, line)
-        y -= 14
-        if y < 60:
-            c.showPage()
-            y = height - 72
+        c.setFont('Helvetica-Oblique', 11)
+        c.drawString(50, y_pos, 'No hay análisis de suelo registrados para esta parcela.')
 
     # Generar y añadir QR code
     qr_img = qrcode.make(verification_url, image_factory=PilImage)
@@ -716,14 +737,16 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db), current_us
     qr_buffer.seek(0)
     
     qr_reader = ImageReader(qr_buffer)
-    # Dibujar el QR en la esquina inferior derecha
-    c.drawImage(qr_reader, width - 120, 48, width=80, height=80, mask='auto')
-    c.setFont('Helvetica', 8)
-    c.drawCentredString(width - 80, 40, "Verificar Autenticidad")
+    c.drawImage(qr_reader, width - 140, 50, width=100, height=100, mask='auto')
+    c.setFont('Helvetica', 9)
+    c.drawCentredString(width - 90, 40, "Verificar Autenticidad")
 
+    # --- Pie de página ---
+    c.setFillColor(COLOR_LIGHT_TEXT)
+    c.setFont('Helvetica-Oblique', 8)
+    c.drawString(50, 60, f'UUID del Certificado: {new_cert_db.uuid}')
+    c.drawString(50, 50, f'Generado el: {new_cert_db.generated_at.strftime("%d/%m/%Y a las %H:%M:%S")} UTC')
 
-    c.setFont('Helvetica-Oblique', 9)
-    c.drawString(48, 48, f'Generado: {datetime.now(timezone.utc).isoformat()} UTC')
     c.save()
 
     buffer.seek(0)
