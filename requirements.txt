@@ -5,3 +5,5 @@ psycopg2-binary
 SQLAlchemy
 python-dotenv
 qrcode[pil]
+passlib[bcrypt]
+python-jose[cryptography]
