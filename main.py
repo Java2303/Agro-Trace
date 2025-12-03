@@ -42,6 +42,17 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 if "DATABASE_URL" not in os.environ:
     load_dotenv(dotenv_path='database.env')
 
+# --- Configuración de SQLAlchemy ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("FATAL ERROR: La variable de entorno DATABASE_URL no está configurada.")
+ 
+# Forzar el uso de SSL para la conexión a PostgreSQL, necesario en Render
+engine = create_engine(DATABASE_URL, connect_args={"sslmode": "require"} if DATABASE_URL.startswith("postgresql://") else {})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
 # MODELS
 class Coordinate(BaseModel):
     x: float
@@ -183,16 +194,6 @@ class Token(BaseModel):
     token_type: str
 
 
-# --- Configuración de SQLAlchemy ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("FATAL ERROR: La variable de entorno DATABASE_URL no está configurada.")
- 
-# Forzar el uso de SSL para la conexión a PostgreSQL, necesario en Render
-engine = create_engine(DATABASE_URL, connect_args={"sslmode": "require"} if DATABASE_URL.startswith("postgresql://") else {})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
 # --- Modelos ORM de SQLAlchemy ---
 class PlotDB(Base):
     __tablename__ = "plots"
@@ -283,9 +284,6 @@ class CertificateDB(Base):
 # --- Creación de Tablas ---
 def init_db():
     Base.metadata.create_all(bind=engine)
-
-init_db()
-
 # --- Gestión de Sesión de DB ---
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
@@ -770,3 +768,7 @@ def resolve_alert(alert_id: int, resolution: AlertResolve, db: Session = Depends
 def read_root():
     """Endpoint de bienvenida para verificar que la API está funcionando."""
     return {"message": "Agro Trace API está corriendo! Dirígete a /docs para ver la documentación."}
+
+# --- Inicialización de la Base de Datos ---
+# Se llama al final para asegurar que todos los modelos ORM estén definidos.
+init_db()
