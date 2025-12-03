@@ -442,11 +442,11 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     db_user = get_user(db, email=user_data.email)
     if db_user:
         raise HTTPException(status_code=400, detail="El email ya está registrado")
-    hashed_password = get_password_hash(user_data.password)
+    
     db_user = UserDB(
         email=user_data.email,
         full_name=user_data.full_name,
-        hashed_password=hashed_password,
+        hashed_password=get_password_hash(user_data.password),
         role=user_data.role
     )
     db.add(db_user)
