@@ -7,3 +7,4 @@ python-dotenv
 qrcode[pil]
 passlib[bcrypt]
 python-jose[cryptography]
+python-multipart
