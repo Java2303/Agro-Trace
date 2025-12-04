@@ -698,7 +698,7 @@ def get_plot_certificate(plot_id: int, db: Session = Depends(get_db), current_us
     try:
         # Construir una ruta absoluta al archivo del logo
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        logo_path = os.path.join(script_dir, "assets", "logo2.svg")
+        logo_path = os.path.join(script_dir, "www", "assets", "logo2.svg")
 
         logo = svg2rlg(logo_path)
         logo.width, logo.height = 60, 60
