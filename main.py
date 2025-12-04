@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 import json
 import io
 from fastapi.responses import StreamingResponse
+import logging
 import uuid
 from dotenv import load_dotenv
 
@@ -36,6 +37,10 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Esquema OAuth2
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# --- Configuración de Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # --- FIN CONFIGURACIÓN DE SEGURIDAD ---
 
@@ -427,6 +432,7 @@ def check_for_alerts(db: Session, plot_id: int, analysis_data: SoilAnalysisDB, p
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()], db: Session = Depends(get_db)):
+    logging.info(f"Intento de inicio de sesión para el usuario: {form_data.username}")
     user = authenticate_user(db, email=form_data.username, password=form_data.password)
     if not user:
         raise HTTPException(
@@ -435,11 +441,13 @@ async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm,
             headers={"WWW-Authenticate": "Bearer"},
         )
     access_token = create_access_token(data={"sub": user.email})
+    logging.info(f"Inicio de sesión exitoso y token generado para: {form_data.username}")
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/users/register", response_model=User, status_code=201)
 def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     db_user = get_user(db, email=user_data.email)
+    logging.info(f"Intento de registro para el nuevo usuario: {user_data.email}")
     if db_user:
         raise HTTPException(status_code=400, detail="El email ya está registrado")
     
@@ -452,6 +460,7 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
+    logging.info(f"Usuario {user_data.email} registrado exitosamente con rol {user_data.role}.")
     return db_user
 
 @app.get("/users/me", response_model=User)
@@ -469,6 +478,7 @@ def list_plots(db: Session = Depends(get_db), current_user: User = Depends(get_c
 @app.post("/plots/", response_model=Plot, status_code=201)
 def create_plot(plot_data: PlotBase, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Crea una nueva parcela con el polígono georreferenciado."""
+    logging.info(f"Usuario '{current_user.email}' está creando una nueva parcela llamada '{plot_data.name}'.")
     coordinates_json = [c.dict() for c in plot_data.coordinates]
     new_plot_db = PlotDB(**plot_data.dict(exclude={'coordinates'}), coordinates=coordinates_json)
     db.add(new_plot_db)
@@ -480,6 +490,7 @@ def create_plot(plot_data: PlotBase, db: Session = Depends(get_db), current_user
         'crop_type': new_plot_db.crop_type,
         'area_hectares': new_plot_db.area_hectares
     })
+    logging.info(f"Parcela '{new_plot_db.name}' (ID: {new_plot_db.id}) creada y registrada en auditoría.")
     
     return new_plot_db
 
@@ -487,6 +498,7 @@ def create_plot(plot_data: PlotBase, db: Session = Depends(get_db), current_user
 def analyze_plot(plot_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Simula un análisis geofísico y actualiza el estado de la parcela."""
     plot_to_analyze = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
+    logging.info(f"Usuario '{current_user.email}' ha solicitado un análisis para la parcela ID: {plot_id}.")
     if not plot_to_analyze:
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
 
@@ -531,6 +543,7 @@ def analyze_plot(plot_id: int, db: Session = Depends(get_db), current_user: User
     })
 
     check_for_alerts(db, plot_id, new_soil_analysis_db, plot_to_analyze.crop_type)
+    logging.info(f"Análisis completado para la parcela ID: {plot_id}. Nuevo estado: {analysis_result_status}.")
     return new_soil_analysis_db
 
 @app.delete("/plots/{plot_id}", status_code=200)
@@ -538,6 +551,7 @@ def delete_plot(plot_id: int, db: Session = Depends(get_db), current_user: User 
     """Elimina una parcela por su ID."""
     plot_to_delete = db.query(PlotDB).filter(PlotDB.id == plot_id).first()
     if not plot_to_delete:
+        logging.error(f"Intento de eliminar parcela no existente. ID: {plot_id} por usuario {current_user.email}")
         raise HTTPException(status_code=404, detail="Parcela no encontrada")
 
     log_audit(db, actor=current_user.email, action='ELIMINAR_PARCELA', target_type='parcela', target_id=str(plot_id), details={
@@ -546,6 +560,7 @@ def delete_plot(plot_id: int, db: Session = Depends(get_db), current_user: User 
 
     db.delete(plot_to_delete)
     db.commit()
+    logging.info(f"Usuario '{current_user.email}' eliminó la parcela '{plot_to_delete.name}' (ID: {plot_id}).")
     return {"message": f"Parcela {plot_id} eliminada correctamente."}
 
 @app.get('/history')
